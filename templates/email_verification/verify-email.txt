@@ -1,4 +1,4 @@
-Subject: Activate Your Account - Profit Prophet
+Subject: Activate Your Account - {{ service_name }}
 
 Dear {{ user_name }},
 
@@ -18,4 +18,4 @@ If you did not request this registration, please ignore this email.
 Thank you for choosing our service!
 
 Best regards,
-The Profit Prophet Team
+The {{ service_name }} Team
