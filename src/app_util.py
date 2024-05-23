@@ -5,6 +5,8 @@ import pandas as pd
 from pathlib import Path
 from enum import Enum
 
+from dynamic_re_metrics_processor import calculate_dynamic_metrics, calculate_series_metrics_df, ZESTIMATE_HISTORY_DF, INDEX_DATA_DICT, RF_DATA
+
 
 class Env(Enum):
     DEV = 1
@@ -15,11 +17,12 @@ env = Env.DEV if os.getenv('ENVIRONMENT') == "DEV" else Env.PROD
 current_directory = Path(__file__).resolve().parent
 
 # Construct the path to the data directory.
-data_directory = current_directory.parent / 'backend_data'
+DATA_DIR = current_directory.parent / 'backend_data'
 
 # Construct the paths to the data files.
-PROPERTY_DF_PATH = data_directory / 'property_df.parquet'
-REGION_DATA_PATH = data_directory / 'regions.json'
+PROPERTY_DF_PATH = DATA_DIR / 'property_static_df.parquet'
+REGION_DATA_PATH = DATA_DIR / 'regions.json'
+
 
 # Load data from files.
 def load_json(path):
@@ -28,122 +31,61 @@ def load_json(path):
     with open(path, 'r', encoding='utf-8') as file:
         return json.load(file)
 
-# Load the property dataframe.
+# Load static backend data.
 BACKEND_PROPERTIES_DF = pd.read_parquet(PROPERTY_DF_PATH).round(2)
-
-# Load region data.
 REGION_TO_ZIP_CODE = {region: set(zip_codes) for region, zip_codes in load_json(REGION_DATA_PATH).items()}
 
-TARGET_COLUMNS = ['Image', 'Save', 'City', 'Rental Income (5% Down)', 'Rent Estimate', 'Price', 'Breakeven Price (5% Down)', 'Competative Price (5% Down)', 'Is Breakeven Price Offending', 'Adjusted CoC (5% Down)', 'Year Built', 'Home Type', 'Bedrooms', 'Bathrooms']
-BACKEND_COL_NAME_TO_FRONTEND_COL_NAME = {
-    "image_url": {
-        "name": "Image"},
-    "city": {
-        "name": "City"},
-    "street_address": {
-        "name": "Property Address"},
-    "purchase_price": {
-        "name": "Price"},
-    "restimate": {
-        "name": "Rent Estimate",
-        "description": "Estimated monthly rent."},
-    "year_built": {
-        "name": "Year Built"},
-    "home_type": {
-        "name": "Home Type",
-        "description": "Type of housing (e.g., Single Family, Townhouse)."},
-    "bedrooms": {
-        "name": "Bedrooms"},
-    "bathrooms": {
-        "name": "Bathrooms"},
-    "zip_code": {
-        "name": "Zip Code"},
-    "gross_rent_multiplier": {
-        "name": "Gross Rent Multiplier",
-        "description": "The ratio of purchase price to annual rental income. A lower ratio indicates a potentially more profitable investment."},
-    "page_view_count": {
-        "name": "Times Viewed"},
-    "favorite_count": {
-        "name": "Favorite Count"},
-    "days_on_zillow": {
-        "name": "Days on Zillow"},
-    "property_tax_rate": {
-        "name": "Tax Rate (%)",
-        "description": "Annual property tax rate."},
-    "living_area": {
-        "name": "Living Area (sq ft)",
-        "description": "Interior space of the property."},
-    "lot_size": {
-        "name": "Lot Size (sq ft)",
-        "description": "Total area of the property's lot."},
-    "mortgage_rate": {
-        "name": "Mortgage Rate",
-        "description": "Interest rate on the mortgage."},
-    "homeowners_insurance": {
-        "name": "Home Insurance",
-        "description": "Monthly cost of homeowners insurance."},
-    "monthly_hoa": {
-        "name": "HOA Fee",
-        "description": "Monthly fee charged by the Homeowners Association."},
-    "home_features_score": {
-        "name": "Home Features Score",
-        "description": "Score representing the quality and number of features."},
-    "is_waterfront": {
-        "name": "Waterfront",
-        "description": "Indicates if the property is located next to a body of water."},
-}
-
+TARGET_COLUMNS = ['Image', 'Save', 'City', 'Rent Estimate', 'Price', 'Year Built', 'Home Type', 'Bedrooms', 'Bathrooms']
 coc_description = 'The (annualized) rate of return on a real estate investment property based on the income that the property is expected to generate'
-BACKEND_COL_NAME_TO_DYNAMIC_FRONTEND_COL_NAME = {
-    # Down payment based keys.
-    "rental_income": {
-        "name": "Rental Income",
-        "description": "The monthly income expected from renting the property, after deducting expenses like mortgage, HOA fees, and insurance."},
-    "Beta": {
-        "name": "Beta",
-        "description": "This represents the purchase price at which the annualized rental income would yield a return comparable to half of the historical average returns of the S&P 500. This benchmark is used to assess the attractiveness of real estate investments relative to traditional stock market investments."},
-    "Alpha": {
-        "name": "Alpha",
-        "description": "Alpha represents the active return of a property compared to the broader real estate market. It measures how much a property's value has deviated from the market average, adjusted for risk. A positive Alpha indicates that the property has appreciated more than the market average, likely due to favorable factors such as location, improvements, or unique market conditions. Conversely, a negative Alpha indicates that the property has underperformed relative to the market benchmark."},
-    "breakeven_price": {
-        "name": "Breakeven Price",
-        "description": "This is the price at which owning the property becomes financially neutral each month, meaning the rental income exactly covers all expenses. It includes factors such as maintenance, HOA fees, mortgage costs, property taxes, and insurance, adjusted for typical vacancy rates. A breakeven price above the asking price suggests the property could generate positive cash flow at the listed price."},
-    "is_breakeven_price_offending": {
-        "name": "Is Breakeven Price Offending",
-        "description": "Indicates whether the breakeven price is significantly lower than the listing price, specifically if it is less than 80% of the listed amount. This metric can be used to assess whether the price at which the property breaks even financially might be considered too low or 'offensive' in a standard real estate negotiation, suggesting a lower than expected value or profitability from the property."},
-    "snp_equivalent_price": {
-        "name": "Competative Price",
-        "description": "The purchase price at which the annualized rental income is comporable to half the historical SnP 500 returns."},
-    "CoC": {
-        "name": "CoC",
-        "description": f"{coc_description}."},
-    "adj_CoC": {
-        "name": "Adjusted CoC",
-        "description": f"{coc_description}, adjusted for maintenance and vacancy rates."},
-    "CoC_no_prepaids": {
-        "name": "CoC w/o Prepaids",
-        "description": f"{coc_description}, without prepaids."},
-    "adj_CoC_no_prepaids": {
-        "name": "Adjusted CoC w/o Prepaids",
-        "description": f"{coc_description}, adjusted for maintenance and vacancy rates, and without prepaids."},
-    "cap_rate": {
-        "name": "Cap Rate",
-        "description": "This is a key real estate valuation measure used to compare different real estate investments. It is calculated as the ratio of the annual rental income generated by the property to the purchase price or current market value, expressed as a percentage. It provides an indication of the potential return on investment."},
-    "adj_cap_rate":  {
-        "name": "Adjusted Cap Rate",
-        "description": "Similar to the Cap Rate, but adjusted for factors like vacancy rates and ongoing maintenance costs, providing a more realistic measure of the property's potential return on investment after accounting for common expenses that reduce net income."},
+BACKEND_COL_NAME_TO_FRONTEND_COL_NAME = {
+    "image_url": {"name": "Image"},
+    "year_built": {"name": "Year Built"},
+    "home_type": {"name": "Home Type", "description": "Type of housing (e.g., Single Family, Townhouse)."},
+    "zip_code": {"name": "Zip Code"},
+    "city": {"name": "City"},
+    "street_address": {"name": "Property Address"},
+    "living_area": {"name": "Living Area (sq ft)", "description": "Interior space of the property."},
+    "lot_size": {"name": "Lot Size (sq ft)", "description": "Total area of the property's lot."},
+    "bedrooms": {"name": "Bedrooms"},
+    "bathrooms": {"name": "Bathrooms"},
+    "purchase_price": {"name": "Price"},
+    "monthly_restimate": {"name": "Rent Estimate", "description": "Estimated monthly rent."},
+    "gross_rent_multiplier": {"name": "Gross Rent Multiplier", "description": "The ratio of purchase price to annual rental income. A lower ratio indicates a potentially more profitable investment."},
+    "annual_property_tax_rate": {"name": "Tax Rate (%)", "description": "Annual property tax rate."},
+    "annual_mortgage_rate": {"name": "Mortgage Rate (%)", "description": "Annual interest rate on the mortgage."},
+    "monthly_homeowners_insurance": {"name": "Home Insurance", "description": "Annual cost of homeowners insurance."},
+    "monthly_hoa": {"name": "HOA Fee", "description": "Monthly fee charged by the Homeowners Association."},
+    "home_features_score": {"name": "Home Features Score", "description": "Score representing the quality and number of features."},
+    "is_waterfront": {"name": "Waterfront", "description": "Indicates if the property is located next to a body of water."},
+    # Down payment dependent metrics.
+    "breakeven_price": {"name": "Breakeven Price", "description": "This is the price at which owning the property becomes financially neutral each month, meaning the rental income exactly covers all expenses. It includes factors such as maintenance, HOA fees, mortgage costs, property taxes, and insurance, adjusted for typical vacancy rates. A breakeven price above the asking price suggests the property could generate positive cash flow at the listed price."},
+    "is_breakeven_price_offending": {"name": "Is Breakeven Price Offending", "description": "Indicates whether the breakeven price is significantly lower than the listing price, specifically if it is less than 80% of the listed amount. This metric can be used to assess whether the price at which the property breaks even financially might be considered too low or 'offensive' in a standard real estate negotiation, suggesting a lower than expected value or profitability from the property."},
+    "CoC": {"name": "CoC", "description": f"{coc_description}."},
+    "adj_CoC": {"name": "Adjusted CoC", "description": f"{coc_description}, adjusted for maintenance and vacancy rates."},
+    "CoC_no_prepaids": {"name": "CoC w/o Prepaids", "description": f"{coc_description}, without prepaids."},
+    "adj_CoC_no_prepaids": {"name": "Adjusted CoC w/o Prepaids", "description": f"{coc_description}, adjusted for maintenance and vacancy rates, and without prepaids."},
+    "monthly_rental_income": {"name": "Rental Income", "description": "The monthly income expected from renting the property, after deducting expenses like mortgage, HOA fees, and insurance."},
+    "cap_rate": {"name": "Cap Rate", "description": "This is a key real estate valuation measure used to compare different real estate investments. It is calculated as the ratio of the annual rental income generated by the property to the purchase price or current market value, expressed as a percentage. It provides an indication of the potential return on investment."},
+    "adj_cap_rate": {"name": "Adjusted Cap Rate", "description": "Similar to the Cap Rate, but adjusted for factors like vacancy rates and ongoing maintenance costs, providing a more realistic measure of the property's potential return on investment after accounting for common expenses that reduce net income."},
 }
 
-# Function to construct a dictionary to map from the input names ot the descriptive ones.
+ADDITIONAL_DESCRIPTIONS = {
+    "Alpha": "A measure of an investment's performance relative to a benchmark, representing the excess return. A positive alpha indicates outperformance.",
+    "Beta": "A measure of an investment's volatility relative to the market. A beta greater than 1 indicates higher volatility than the market, while a beta less than 1 indicates lower volatility.",
+    "Sharpe Ratio": "A measure of risk-adjusted return, calculated as the average excess return divided by the standard deviation of returns. Higher values indicate better risk-adjusted performance.",
+    "Sortino Ratio": "A measure of risk-adjusted return that focuses on downside risk, calculated as the average excess return divided by the standard deviation of negative returns. Higher values indicate better risk-adjusted performance with a focus on downside risk.",
+    "Max Drawdown (%)": "The largest peak-to-trough decline in the value of an investment, expressed as a fraction. Indicates the maximum loss from the highest value.",
+    "Recovery Time (Days)": "The time, in days, taken for an investment to recover from its maximum drawdown to its previous peak value.",
+    "Kendall Tau": "A measure of rank correlation between two variables, ranging from -1 to 1. Indicates the strength and direction of a monotonic relationship.",
+    "Spearman Rho": "A measure of rank correlation between two variables, ranging from -1 to 1. Indicates the strength and direction of a monotonic relationship.",
+}
+
+FRONTEND_COL_NAME_TO_BACKEND_COL_NAME = {value["name"]: key for key, value in BACKEND_COL_NAME_TO_FRONTEND_COL_NAME.items()}
+
 def create_rename_dict():
     rename_dict = {}
     for old_name, props in BACKEND_COL_NAME_TO_FRONTEND_COL_NAME.items():
         rename_dict[old_name] = props['name']
-    
-    for old_name, props in BACKEND_COL_NAME_TO_DYNAMIC_FRONTEND_COL_NAME.items():
-        rename_dict[old_name] = props['name']
-        rename_dict[f"{old_name}_5%_down"] = f"{props['name']} (5% Down)"
-    
     return rename_dict
 
 def create_description_dict():
@@ -151,20 +93,17 @@ def create_description_dict():
     for props in BACKEND_COL_NAME_TO_FRONTEND_COL_NAME.values():
         if 'description' in props:
             description_dict[props['name']] = props['description']
-    
-    for props in BACKEND_COL_NAME_TO_DYNAMIC_FRONTEND_COL_NAME.values():
-        if 'description' in props:
-            description_dict[props['name']] = props['description']
-            description_dict[f"{props['name']} (5% Down)"] = f"Given a 5% down payment... {props['description']}"
-    
+    for name, description in ADDITIONAL_DESCRIPTIONS.items():
+        description_dict[name] = description
     return description_dict
 
-
-def properties_df_from_search_request_data(request_data):
+def filter_properties_df_with_request_data(request_data):
     region = request_data.get('region')
     home_type = request_data.get('home_type')
-    year_built = int(request_data.get('year_built'))
-    max_price = float(request_data.get('max_price'))
+    year_built = request_data.get('year_built')
+    year_built = int(year_built) if year_built else 0
+    max_price = request_data.get('max_price')
+    max_price = int(max_price) if max_price else 0
     city = request_data.get('city')
     is_waterfront = request_data.get('is_waterfront')
     is_cashflowing = bool(request_data.get('is_cashflowing'))
@@ -181,31 +120,40 @@ def properties_df_from_search_request_data(request_data):
     if is_waterfront:
         properties_df = properties_df[properties_df['is_waterfront'] == 'True']
     if is_cashflowing:
-        properties_df = properties_df[properties_df['adj_CoC_5%_down'] >= 0.0]
+        properties_df = properties_df[properties_df['monthly_rental_income'] >= 0.0]
     if city:
         properties_df = properties_df[properties_df['city'] == city.title()]
 
     return properties_df
 
-def properties_response_from_properties_df(properties_df, num_properties_per_page=1, page=1, saved_zpids={}):
+def properties_response_with_metrics(logger, properties_df, down_payment_percentage, index_ticker, sort_by, sort_order, num_properties_per_page=1, page=1, saved_zpids={}):
     num_properties_found = properties_df.shape[0]
-    properties_df = properties_df.sort_values(by='adj_CoC_5%_down', ascending=False)
-    # Calculate the total number of pages of listings in the backend to send to the frontend for the back/next buttons.
+    full_properties_df = pd.concat([
+        properties_df,
+        calculate_dynamic_metrics(properties_df, down_payment_percentage).round(2)
+    ], axis=1)
+    full_properties_df.sort_values(by=FRONTEND_COL_NAME_TO_BACKEND_COL_NAME[sort_by], ascending=(sort_order == 'asc'), inplace=True)
+
     total_pages = math.ceil(num_properties_found / num_properties_per_page)
-    # We sort by CoC before filtering.
-    start_property_index, stop_property_index = (page-1)*num_properties_per_page, page*num_properties_per_page
-    properties_df = properties_df[start_property_index:stop_property_index]
+    start_property_index, stop_property_index = (page - 1) * num_properties_per_page, page * num_properties_per_page
+    full_properties_df = full_properties_df.iloc[start_property_index:stop_property_index].copy()
 
-    for zpid, _ in properties_df.iterrows():
-        properties_df.loc[zpid, 'Save'] = zpid in saved_zpids
-        properties_df.loc[zpid, 'zpid'] = zpid
+    if not full_properties_df.empty:
+        full_properties_df = full_properties_df.merge(
+            calculate_series_metrics_df(down_payment_percentage, ZESTIMATE_HISTORY_DF, INDEX_DATA_DICT[index_ticker], RF_DATA, zpids=full_properties_df.index, logger=logger).round(2),
+            left_index=True,
+            right_index=True,
+            how='left'
+        )
 
-    # Add the zpid as a column.
-    properties_df.rename(columns=create_rename_dict(), inplace=True)
+    full_properties_df['Save'] = full_properties_df.index.isin(saved_zpids)
+    full_properties_df['zpid'] = full_properties_df.index
+
+    full_properties_df.rename(columns=create_rename_dict(), inplace=True)
 
     if num_properties_found:
-        ordered_cols = TARGET_COLUMNS + [col for col in properties_df.columns if col not in set(TARGET_COLUMNS)]
-        ordered_properties_data = properties_df[ordered_cols].to_json(orient="records")
+        ordered_cols = TARGET_COLUMNS + [col for col in full_properties_df.columns if col not in set(TARGET_COLUMNS)]
+        ordered_properties_data = full_properties_df[ordered_cols].to_json(orient="records")
     else:
         ordered_properties_data = '{}'
     return {

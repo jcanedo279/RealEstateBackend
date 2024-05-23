@@ -4,11 +4,11 @@ import json
 import jwt
 from datetime import datetime, timedelta, timezone
 
-from app_util import BACKEND_PROPERTIES_DF, properties_df_from_search_request_data, properties_response_from_properties_df, env, Env, REGION_TO_ZIP_CODE
+from app_util import BACKEND_PROPERTIES_DF, filter_properties_df_with_request_data, properties_response_with_metrics, env, Env, FRONTEND_COL_NAME_TO_BACKEND_COL_NAME
 from email_service_util import email_app
 
 from flask_cors import CORS
-from flask import Flask, render_template, request, Response, jsonify, render_template, url_for, abort, redirect
+from flask import Flask, render_template, request, Response, jsonify, render_template, url_for
 from flask_login import LoginManager, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
@@ -31,6 +31,8 @@ NGINX_URL = os.environ.get('REACT_APP_NGINX_URL')
 logging_level = logging.DEBUG if env == Env.DEV else logging.INFO
 app.logger.setLevel(logging_level)
 app.secret_key = os.environ.get('APP_SECRET_KEY')
+app.logger.info(f"Mapping is: {FRONTEND_COL_NAME_TO_BACKEND_COL_NAME}")
+app.logger.info(f"Backend column names are: {list(BACKEND_PROPERTIES_DF.columns)}")
 
 login_manager = LoginManager()
 login_manager.init_app(app)
@@ -43,7 +45,7 @@ app.config['JWT_COOKIE_SECURE'] = (env == Env.PROD)  # Only send cookies over ht
 app.config['JWT_ACCESS_COOKIE_PATH'] = '/'  # Path where cookies are valid
 app.config['JWT_REFRESH_COOKIE_PATH'] = '/'  # Path where cookies are valid
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)
-app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(hours=6)
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(hours=2)
 app.config['JWT_COOKIE_CSRF_PROTECT'] = True  # Enable CSRF protection
 app.config['JWT_COOKIE_SAMESITE'] = 'Lax'
 
@@ -214,9 +216,9 @@ def send_password_reset_email(user_email):
 ## LISTING ROUTES ##
 ####################
 
-def properties_response(properties_df, num_properties_per_page=1, page=1, user_obj=None):
+def properties_response(properties_df, down_payment, index_ticker, sort_by, sort_order, num_properties_per_page=1, page=1, user_obj=None):
     saved_zpids = set(user_obj.saved) if user_obj else {}
-    response_data = properties_response_from_properties_df(properties_df, num_properties_per_page=num_properties_per_page, page=page, saved_zpids=saved_zpids)
+    response_data = properties_response_with_metrics(app.logger, properties_df, down_payment, index_ticker, sort_by, sort_order, num_properties_per_page=num_properties_per_page, page=page, saved_zpids=saved_zpids)
     # If the user is logged out, add a description to log in.
     if user_obj:
         response_data['descriptions']['Save'] = 'Save/unsave this property to go back to it later.'
@@ -242,42 +244,45 @@ def explore():
     request_data = request.get_json()
     page = int(request_data.get('current_page'))
     num_properties_per_page = int(request_data.get('num_properties_per_page'))
-    properties_df = properties_df_from_search_request_data(request_data)
+    down_payment_percentage = float(request_data.get('down_payment_percentage'))/100
+    index_ticker = request_data.get('index_ticker')
+    sort_by, sort_order = request_data.get('sortBy'), request_data.get('sortOrder')
+    properties_df = filter_properties_df_with_request_data(request_data)
 
-    response_data = properties_response(properties_df, num_properties_per_page=num_properties_per_page, page=page, user_obj=user_obj)
+    response_data = properties_response(properties_df, down_payment_percentage, index_ticker, sort_by, sort_order, num_properties_per_page=num_properties_per_page, page=page, user_obj=user_obj)
     response_json = json.dumps(response_data)
     return Response(response_json, mimetype='application/json')
 
-@app.route('/api/search', methods=['POST'])
-@jwt_required(optional=True)
-def search():
-    user_email = get_jwt_identity()
-    user_obj = maybe_load_user(user_email)
+# @app.route('/api/search', methods=['POST'])
+# @jwt_required(optional=True)
+# def search():
+#     user_email = get_jwt_identity()
+#     user_obj = maybe_load_user(user_email)
 
-    request_data = request.get_json()
-    page = int(request_data.get('current_page'))
-    property_address = request_data.get('property_address', '')
-    properties_df = search_properties(property_address)
-    num_properties_per_page = max(min(len(properties_df), 10), 1)
+#     request_data = request.get_json()
+#     page = int(request_data.get('current_page'))
+#     property_address = request_data.get('property_address', '')
+#     properties_df = search_properties(property_address)
+#     num_properties_per_page = max(min(len(properties_df), 10), 1)
 
-    response_data = properties_response(properties_df, num_properties_per_page=num_properties_per_page, page=page, user_obj=user_obj)
-    response_json = json.dumps(response_data)
-    return Response(response_json, mimetype='application/json')
+#     response_data = properties_response(properties_df, num_properties_per_page=num_properties_per_page, page=page, user_obj=user_obj)
+#     response_json = json.dumps(response_data)
+#     return Response(response_json, mimetype='application/json')
 
-@app.route('/api/saved', methods=['POST'])
-@jwt_required()
-def saved():
-    user_email = get_jwt_identity()
-    user_obj = maybe_load_user(user_email)
+# @app.route('/api/saved', methods=['POST'])
+# @jwt_required()
+# def saved():
+#     user_email = get_jwt_identity()
+#     user_obj = maybe_load_user(user_email)
 
-    request_data = request.get_json()
-    page = int(request_data.get('current_page'))
-    properties_df = BACKEND_PROPERTIES_DF.loc[list(user_obj.saved)]
-    num_properties_per_page = max(min(len(properties_df), 10), 1)
+#     request_data = request.get_json()
+#     page = int(request_data.get('current_page'))
+#     properties_df = BACKEND_PROPERTIES_DF.loc[list(user_obj.saved)]
+#     num_properties_per_page = max(min(len(properties_df), 10), 1)
 
-    response_data = properties_response(properties_df, num_properties_per_page=num_properties_per_page, page=page, user_obj=user_obj)
-    response_json = json.dumps(response_data)
-    return Response(response_json, mimetype='application/json')
+#     response_data = properties_response(properties_df, num_properties_per_page=num_properties_per_page, page=page, user_obj=user_obj)
+#     response_json = json.dumps(response_data)
+#     return Response(response_json, mimetype='application/json')
 
 @app.route('/api/toggle-save', methods=['POST'])
 @jwt_required()
@@ -460,6 +465,23 @@ def register():
     # Send confirmation email
     send_email_verification_email(user_email)
     return jsonify(fancy_flash('Please confirm your email address.', 'success', 'register', 'fadeIn')), 200
+
+@app.route('/api/delete-account', methods=['DELETE'])
+@jwt_required()
+def delete_account():
+    user_email = get_jwt_identity()
+    user_obj = maybe_load_user(user_email)
+
+    if not user_obj:
+        return jsonify(fancy_flash('User not found.', 'error', 'delete-account', 'shake')), 404
+
+    # Remove user from the user store
+    if user_email in users:
+        del users[user_email]
+        response = jsonify(fancy_flash('Your account has been successfully deleted.', 'success', 'delete-account', 'fadeIn'))
+        return clear_jwts(response), 200
+    else:
+        return jsonify(fancy_flash('An error occurred while trying to delete your account.', 'error', 'delete-account', 'shake'))
 
 @app.route('/api/email/verify/<token>', methods=['POST'])
 def email_verification(token):
