@@ -49,6 +49,8 @@ DATA_DIR = current_directory.parent / 'backend_data'
 # Construct the paths to the data files.
 ZESTIMATE_HISTORY_DF_PATH = DATA_DIR / 'zestimate_history_df.parquet'
 TIMESERIES_DATA_PATH = DATA_DIR / 'timeseries'
+os.makedirs(TIMESERIES_DATA_PATH, exist_ok=True)
+
 
 
 def load_zestimate_histories_parquet(path):
@@ -86,6 +88,7 @@ def save_data_to_disk(data, path):
     data.to_csv(path)
 
 def load_data_from_disk(path):
+    print(path)
     return pd.read_csv(path, index_col=0, parse_dates=True)
 
 def is_data_fresh(path):
@@ -131,28 +134,28 @@ INDEX_DATA_DICT, RF_DATA = initialize_data()
 
 
 def calculate_purchase_fees(purchase_price, down_payment):
-    FLORIDA_ORIGINATION_FEE_RATE = 0.0075
-    FLORIDA_LENDERS_TITLE_INSURANCE_BASE_FEE = 575
-    FLORIDA_OWNERS_TITLE_INSURANCE_BASE_FEE = 40
-    FLORIDA_OWNERS_TITLE_INSURANCE_RATE = 2.4411138235
-    FLORIDA_MORTGAGES_TAX_RATE = 0.0035
-    FLORIDA_DEEDS_TAX_RATE = 0.007
-    FLORIDA_INTANGIBLE_TAX_RATE = 0.002
+    ORIGINATION_FEE_RATE = 0.0075
+    LENDERS_TITLE_INSURANCE_BASE_FEE = 575
+    OWNERS_TITLE_INSURANCE_BASE_FEE = 40
+    OWNERS_TITLE_INSURANCE_RATE = 2.4411138235
+    MORTGAGES_TAX_RATE = 0.0035
+    DEEDS_TAX_RATE = 0.007
+    INTANGIBLE_TAX_RATE = 0.002
 
-    origination_fee = FLORIDA_ORIGINATION_FEE_RATE * purchase_price
+    origination_fee = ORIGINATION_FEE_RATE * purchase_price
     lenders_title_insurance_fee = np.where(
         purchase_price >= 100000,
-        FLORIDA_LENDERS_TITLE_INSURANCE_BASE_FEE + 5 * ((purchase_price - 100000) / 1000),
-        FLORIDA_LENDERS_TITLE_INSURANCE_BASE_FEE
+        LENDERS_TITLE_INSURANCE_BASE_FEE + 5 * ((purchase_price - 100000) / 1000),
+        LENDERS_TITLE_INSURANCE_BASE_FEE
     )
     owners_title_insurance_fee = np.where(
         purchase_price >= 100000,
-        FLORIDA_OWNERS_TITLE_INSURANCE_BASE_FEE + FLORIDA_OWNERS_TITLE_INSURANCE_RATE * ((purchase_price - 100000) / 1000),
-        FLORIDA_OWNERS_TITLE_INSURANCE_BASE_FEE
+        OWNERS_TITLE_INSURANCE_BASE_FEE + OWNERS_TITLE_INSURANCE_RATE * ((purchase_price - 100000) / 1000),
+        OWNERS_TITLE_INSURANCE_BASE_FEE
     )
     financed_amount = purchase_price * (1 - down_payment)
-    state_and_stamps_tax = (FLORIDA_MORTGAGES_TAX_RATE + FLORIDA_DEEDS_TAX_RATE) * financed_amount
-    intangible_tax = FLORIDA_INTANGIBLE_TAX_RATE * financed_amount
+    state_and_stamps_tax = MORTGAGES_TAX_RATE * financed_amount + DEEDS_TAX_RATE * purchase_price
+    intangible_tax = INTANGIBLE_TAX_RATE * financed_amount
 
     total_fees = origination_fee + lenders_title_insurance_fee + owners_title_insurance_fee + state_and_stamps_tax + intangible_tax
     return total_fees
@@ -187,11 +190,11 @@ def purchase_price_from_cash_flow_percentage(purchase_price, down_payment_percen
                 (monthly_homeowners_insurance / purchase_price))
     return (monthly_restimate * (1 - VACANCY_RATE) - monthly_hoa) / (monthly_cost_rate + (annual_cash_flow_rate / MONTHS_IN_YEAR))
 
-def calculate_monthly_costs(df, down_payment_percentage):
+def calculate_monthly_costs(df, down_payment_percentage, annual_mortgage_rate):
     down_payment = df['purchase_price'] * down_payment_percentage
     loan_amount = df['purchase_price'] - down_payment
-    
-    monthly_mortgage_payment = loan_amount * calculate_monthly_mortgage_rate(df['annual_mortgage_rate'] / 100)
+
+    monthly_mortgage_payment = loan_amount * calculate_monthly_mortgage_rate(annual_mortgage_rate / 100)
     monthly_property_tax = (df['purchase_price'] * df['annual_property_tax_rate'] / 100) / MONTHS_IN_YEAR
     monthly_pmi = df['purchase_price'] * get_annual_pmi_rate(down_payment_percentage) / MONTHS_IN_YEAR
     monthly_costs = (
@@ -214,19 +217,21 @@ def calculate_monthly_costs(df, down_payment_percentage):
     )
     return monthly_costs, cash_invested, prepaid_costs
 
-def calculate_dynamic_metrics(df, down_payment_percentage):
-    monthly_costs, cash_invested, prepaid_costs = calculate_monthly_costs(df, down_payment_percentage)
+def calculate_dynamic_metrics(df, down_payment_percentage, override_annual_mortgage_rate=None):
+    annual_mortgage_rate = override_annual_mortgage_rate if override_annual_mortgage_rate else df['annual_mortgage_rate']
+    monthly_costs, cash_invested, prepaid_costs = calculate_monthly_costs(df, down_payment_percentage, annual_mortgage_rate)
 
     monthly_rental_income = df['monthly_restimate'] * (1 - VACANCY_RATE) - monthly_costs - (MONTHLY_MAINTENANCE_RATE * df['purchase_price'])
     breakeven_purchase_price = purchase_price_from_cash_flow_percentage(
         df['purchase_price'], down_payment_percentage, df['monthly_restimate'],
-        df['monthly_hoa'], df['monthly_homeowners_insurance'], df['annual_mortgage_rate'] / 100,
+        df['monthly_hoa'], df['monthly_homeowners_insurance'], annual_mortgage_rate / 100,
         df['annual_property_tax_rate'] / 100
     )
 
     is_breakeven_price_offending = np.abs(df['purchase_price'] - breakeven_purchase_price) > 0.2 * df['purchase_price']
 
     metrics = pd.DataFrame({
+        'total_monthly_cost': monthly_costs,
         'monthly_rental_income': monthly_rental_income,
         'breakeven_price': breakeven_purchase_price,
         'is_breakeven_price_offending': np.where(is_breakeven_price_offending, "True", "False"),
@@ -240,10 +245,10 @@ def calculate_dynamic_metrics(df, down_payment_percentage):
     return metrics
 
 
-def calculate_series_metrics_df(down_payment_percentage, zestimate_histories_df, index_df, rf_df, zpids=None, simplified=False, logger=None, ignore_nonlinear=False, var_confidence_level=0.95):
+def calculate_series_metrics_df(down_payment_percentage, zestimate_histories_df, mortgage_apr_series, index_df, rf_df, override_annual_mortgage_rate=None, zpids=None, simplified=False, ignore_nonlinear=False, var_confidence_level=0.95):
     # Define metric keys
     metric_keys = ['Alpha', 'Beta', 'Sharpe Ratio', 'Sortino Ratio', 'Max Drawdown (%)', 'Recovery Time (Days)', 'Kendall Tau', 'Spearman Rho', 'Historical VaR']
-    
+
     # Check for missing zpids
     provided_zpids_set = set(zpids) if zpids is not None else set()
     available_zpids_set = set(zestimate_histories_df['zpid'].unique())
@@ -277,6 +282,12 @@ def calculate_series_metrics_df(down_payment_percentage, zestimate_histories_df,
     aligned_df = pd.merge_asof(zestimate_histories_df.reset_index(), index_df[['Adj Close']].reset_index(), on='Date', direction='nearest')
     aligned_df = pd.merge_asof(aligned_df, rf_df[['Risk Free Rate']].reset_index(), on='Date', direction='nearest')
 
+    # Set APR based on override or series values
+    if override_annual_mortgage_rate:
+        aligned_df['APR'] = override_annual_mortgage_rate
+    else:
+        aligned_df = aligned_df.set_index('zpid').join(mortgage_apr_series.rename('APR')).reset_index()
+
     # Check if the aligned DataFrame is empty
     if aligned_df.empty:
         result_df = pd.DataFrame.from_dict(missing_zpids_reasons, orient='index')
@@ -289,7 +300,7 @@ def calculate_series_metrics_df(down_payment_percentage, zestimate_histories_df,
         initial_price = aligned_df.groupby('zpid')['Price'].transform('first')
         down_payment_amount = initial_price * down_payment_percentage
         loan_amount = initial_price - down_payment_amount
-        monthly_mortgage_payment = loan_amount * MIN_APR / MONTHS_IN_YEAR
+        monthly_mortgage_payment = loan_amount * aligned_df['APR'] / MONTHS_IN_YEAR
 
         aligned_df['Cumulative Mortgage Payments'] = monthly_mortgage_payment.groupby(aligned_df['zpid']).cumsum()
         aligned_df['Equity'] = aligned_df['Price'] - loan_amount + down_payment_amount - aligned_df['Cumulative Mortgage Payments']
@@ -351,7 +362,7 @@ def calculate_series_metrics_df(down_payment_percentage, zestimate_histories_df,
             extreme_values_detected = True
             metrics['Alpha'], metrics['Beta'] = 'Extreme values detected', 'Extreme values detected'
 
-        if not extreme_values_detected:
+        if not extreme_values_detected or not ignore_nonlinear:
             # Perform the linear regression for alpha and beta
             reg = LinearRegression().fit(stock_returns, price_returns)
             beta = reg.coef_[0][0]
@@ -359,7 +370,7 @@ def calculate_series_metrics_df(down_payment_percentage, zestimate_histories_df,
 
             # Check for non-linear patterns (large deviations can be considered non-linear)
             residuals = price_returns - reg.predict(stock_returns)
-            if np.std(residuals) / np.std(price_returns) > 0.5:
+            if ignore_nonlinear and (np.std(residuals) / np.std(price_returns) > 0.5):
                 metrics['Alpha'], metrics['Beta'] = 'Non-linear pattern detected', 'Non-linear pattern detected'
             else:
                 metrics['Alpha'], metrics['Beta'] = round(alpha, 8), round(beta, 8)
@@ -375,13 +386,13 @@ def calculate_series_metrics_df(down_payment_percentage, zestimate_histories_df,
 
         # Calculate Sortino Ratio
         downside_std = np.std(group['Excess Price Returns'][group['Excess Price Returns'] < 0])
-        if downside_std != 0:
+        if downside_std != 0 and not np.isnan(downside_std):
             sortino_ratio = mean_excess_return / downside_std
             metrics['Sortino Ratio'] = round(sortino_ratio, 8)
         else:
             metrics['Sortino Ratio'] = 'Zero downside deviation in returns'
 
-        # Calculate maximum drawdown using cumulative returns
+        # Calculate maximum drawdown using percentage returns
         cumulative_return = (1 + group['Price Returns']).cumprod()
         peak = cumulative_return.cummax()
         drawdown = (cumulative_return - peak) / peak

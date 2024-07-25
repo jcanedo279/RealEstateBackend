@@ -4,7 +4,9 @@ import json
 import jwt
 from datetime import datetime, timedelta, timezone
 
-from app_util import BACKEND_PROPERTIES_DF, filter_properties_df_with_request_data, properties_response_with_metrics, env, Env, FRONTEND_COL_NAME_TO_BACKEND_COL_NAME
+from app_util import get_properties_response_from_attributes, get_properties_from_attributes, compare_properties_response_from_attributes, create_rename_dict, env, Env, BACKEND_PROPERTIES_DF
+from visual_analysis import prepare_distribution_graph_data
+
 from email_service_util import email_app
 
 from flask_cors import CORS
@@ -31,8 +33,6 @@ NGINX_URL = os.environ.get('REACT_APP_NGINX_URL')
 logging_level = logging.DEBUG if env == Env.DEV else logging.INFO
 app.logger.setLevel(logging_level)
 app.secret_key = os.environ.get('APP_SECRET_KEY')
-app.logger.info(f"Mapping is: {FRONTEND_COL_NAME_TO_BACKEND_COL_NAME}")
-app.logger.info(f"Backend column names are: {list(BACKEND_PROPERTIES_DF.columns)}")
 
 login_manager = LoginManager()
 login_manager.init_app(app)
@@ -216,20 +216,6 @@ def send_password_reset_email(user_email):
 ## LISTING ROUTES ##
 ####################
 
-def properties_response(properties_df, down_payment, index_ticker, sort_by, sort_order, num_properties_per_page=1, page=1, user_obj=None):
-    saved_zpids = set(user_obj.saved) if user_obj else {}
-    response_data = properties_response_with_metrics(app.logger, properties_df, down_payment, index_ticker, sort_by, sort_order, num_properties_per_page=num_properties_per_page, page=page, saved_zpids=saved_zpids)
-    # If the user is logged out, add a description to log in.
-    if user_obj:
-        response_data['descriptions']['Save'] = 'Save/unsave this property to go back to it later.'
-    else:
-        response_data['descriptions']['Save'] = 'To save a property you must first login.'
-    return response_data
-
-def search_properties(query_address):
-    # Filter the DataFrame for addresses that contain the query string, case-insensitive
-    return BACKEND_PROPERTIES_DF[BACKEND_PROPERTIES_DF['street_address'].str.contains(query_address, case=False, na=False)]
-
 @app.route('/api/test', methods=['GET'])
 def test_route():
     return fancy_flash('Hello from the backend!', 'success', 'test', 'fadeIn'), 200
@@ -237,52 +223,24 @@ def test_route():
 @app.route('/api/explore', methods=['POST'])
 @jwt_required()
 def explore():
-    # Retrieve the user identity if the session is authenticated
+    # Retrieve the user identity if the session is authenticated.
     user_email = get_jwt_identity()
     user_obj = maybe_load_user(user_email)
 
     request_data = request.get_json()
-    page = int(request_data.get('current_page'))
-    num_properties_per_page = int(request_data.get('num_properties_per_page'))
-    down_payment_percentage = float(request_data.get('down_payment_percentage'))/100
-    index_ticker = request_data.get('index_ticker')
-    sort_by, sort_order = request_data.get('sortBy'), request_data.get('sortOrder')
-    properties_df = filter_properties_df_with_request_data(request_data)
+    
+    #Filter properties by requested user saved properties.
+    is_saved = bool(request_data.get('is_saved', False))
+    saved_ids = set(user_obj.saved) if user_obj else set()
+    filter_by_ids = saved_ids if is_saved else set()
 
-    response_data = properties_response(properties_df, down_payment_percentage, index_ticker, sort_by, sort_order, num_properties_per_page=num_properties_per_page, page=page, user_obj=user_obj)
-    response_json = json.dumps(response_data)
-    return Response(response_json, mimetype='application/json')
+    response_data = get_properties_response_from_attributes(request_data, filter_by_ids=filter_by_ids, saved_ids=saved_ids)
+    if user_obj:
+        response_data['descriptions']['Save'] = 'Save/unsave this property to go back to it later.'
+    else:
+        response_data['descriptions']['Save'] = 'To save a property you must first login.'
 
-# @app.route('/api/search', methods=['POST'])
-# @jwt_required(optional=True)
-# def search():
-#     user_email = get_jwt_identity()
-#     user_obj = maybe_load_user(user_email)
-
-#     request_data = request.get_json()
-#     page = int(request_data.get('current_page'))
-#     property_address = request_data.get('property_address', '')
-#     properties_df = search_properties(property_address)
-#     num_properties_per_page = max(min(len(properties_df), 10), 1)
-
-#     response_data = properties_response(properties_df, num_properties_per_page=num_properties_per_page, page=page, user_obj=user_obj)
-#     response_json = json.dumps(response_data)
-#     return Response(response_json, mimetype='application/json')
-
-# @app.route('/api/saved', methods=['POST'])
-# @jwt_required()
-# def saved():
-#     user_email = get_jwt_identity()
-#     user_obj = maybe_load_user(user_email)
-
-#     request_data = request.get_json()
-#     page = int(request_data.get('current_page'))
-#     properties_df = BACKEND_PROPERTIES_DF.loc[list(user_obj.saved)]
-#     num_properties_per_page = max(min(len(properties_df), 10), 1)
-
-#     response_data = properties_response(properties_df, num_properties_per_page=num_properties_per_page, page=page, user_obj=user_obj)
-#     response_json = json.dumps(response_data)
-#     return Response(response_json, mimetype='application/json')
+    return Response(json.dumps(response_data), mimetype='application/json')
 
 @app.route('/api/toggle-save', methods=['POST'])
 @jwt_required()
@@ -299,6 +257,61 @@ def toggle_save():
         user_obj.saved.add(property_id)
         saved = True
     return jsonify({'success': True, 'saved': saved})
+
+@app.route('/api/distribution_graph_data', methods=['POST'])
+@jwt_required()
+def get_distribution_graph_data():
+    user_email = get_jwt_identity()
+    user_obj = maybe_load_user(user_email)
+
+    request_data = request.get_json()
+
+    is_saved = bool(request_data.get('is_saved', False))
+    saved_ids = set(user_obj.saved) if user_obj else set()
+    filter_by_ids = saved_ids if is_saved else set()
+
+    use_filtered_data = request_data.get('useFilteredData', False)
+
+    if use_filtered_data:
+        properties_df, _ = get_properties_from_attributes(
+            request_data,
+            calculate_series_metrics=False,
+            filter_by_ids=filter_by_ids
+        )
+        properties_df.rename(columns=create_rename_dict(), inplace=True)
+    else:
+        properties_df = BACKEND_PROPERTIES_DF.copy()
+        properties_df.rename(columns=create_rename_dict(), inplace=True)
+
+    aggregates = request_data.get('aggregates', [])
+    visualize_options = request_data.get('visualizeOptions', ['Price'])
+    bins = int(request_data.get('bins', 30))
+    property_data = request_data.get('propertyData', {})
+
+    if not visualize_options:
+        return jsonify({"error": "You need to specify something to visualize by..."}), 400
+
+    data = prepare_distribution_graph_data(properties_df, aggregates, visualize_options, bins, property_data)
+    return jsonify(data)
+
+@app.route('/api/compare', methods=['POST'])
+@jwt_required()
+def compare():
+    # Retrieve the user identity if the session is authenticated.
+    user_email = get_jwt_identity()
+    user_obj = maybe_load_user(user_email)
+
+    request_data = request.get_json()
+
+    response_data = compare_properties_response_from_attributes(request_data)
+    aggregates = response_data.groupby('list_id').agg({
+        'purchase_price': 'sum',
+        'monthly_costs': 'sum',
+        'cash_invested': 'sum',
+        'monthly_restimate': 'sum'
+    }).reset_index()
+
+    return Response(aggregates.to_json(), mimetype='application/json')
 
 
 ###########################

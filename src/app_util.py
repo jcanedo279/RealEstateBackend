@@ -5,7 +5,7 @@ import pandas as pd
 from pathlib import Path
 from enum import Enum
 
-from dynamic_re_metrics_processor import calculate_dynamic_metrics, calculate_series_metrics_df, ZESTIMATE_HISTORY_DF, INDEX_DATA_DICT, RF_DATA
+from dynamic_re_metrics_processor import calculate_dynamic_metrics, calculate_series_metrics_df, calculate_monthly_costs, ZESTIMATE_HISTORY_DF, INDEX_DATA_DICT, RF_DATA
 
 
 class Env(Enum):
@@ -50,6 +50,7 @@ BACKEND_COL_NAME_TO_FRONTEND_COL_NAME = {
     "bathrooms": {"name": "Bathrooms"},
     "purchase_price": {"name": "Price"},
     "monthly_restimate": {"name": "Rent Estimate", "description": "Estimated monthly rent."},
+    "total_monthly_cost": {"name": "Total Monthly Cost", "description": "Sum of all monthly expenses, including mortgage payment, PMI, property tax, homeowners insurance, and HOA fees."},
     "gross_rent_multiplier": {"name": "Gross Rent Multiplier", "description": "The ratio of purchase price to annual rental income. A lower ratio indicates a potentially more profitable investment."},
     "annual_property_tax_rate": {"name": "Tax Rate (%)", "description": "Annual property tax rate."},
     "annual_mortgage_rate": {"name": "Mortgage Rate (%)", "description": "Annual interest rate on the mortgage."},
@@ -97,68 +98,160 @@ def create_description_dict():
         description_dict[name] = description
     return description_dict
 
-def filter_properties_df_with_request_data(request_data):
-    region = request_data.get('region')
-    home_type = request_data.get('home_type')
-    year_built = request_data.get('year_built')
-    year_built = int(year_built) if year_built else 0
-    max_price = request_data.get('max_price')
-    max_price = int(max_price) if max_price else 0
-    city = request_data.get('city')
-    is_waterfront = request_data.get('is_waterfront')
-    is_cashflowing = bool(request_data.get('is_cashflowing'))
 
-    properties_df = BACKEND_PROPERTIES_DF.copy()
-    if region != "ANY_AREA":
-        properties_df = properties_df[properties_df['zip_code'].isin(REGION_TO_ZIP_CODE[region])]
-    if home_type != "ANY":
-        properties_df = properties_df[properties_df['home_type'] == home_type]
-    if year_built:
-        properties_df = properties_df[properties_df['year_built'] >= year_built]
-    if max_price:
-        properties_df = properties_df[properties_df['purchase_price'] <= max_price]
-    if is_waterfront:
-        properties_df = properties_df[properties_df['is_waterfront'] == 'True']
-    if is_cashflowing:
-        properties_df = properties_df[properties_df['monthly_rental_income'] >= 0.0]
-    if city:
-        properties_df = properties_df[properties_df['city'] == city.title()]
+def get_properties_from_attributes(property_attributes, page=1, properties_per_page=-1, calculate_series_metrics=False, filter_by_ids=set()):
+    # Retrieve static metrics filtered by static metrics.
+    filtered_properties_df = create_filtered_properties_from_static_attributes(property_attributes, filter_by_ids=filter_by_ids)
 
-    return properties_df
+    # After filtering by static attributes, we filter by address since this is a more expensive string check.
+    filter_by_address = property_attributes.get('property_address', '') or ''
+    if filter_by_address:
+        filtered_properties_df = filtered_properties_df[filtered_properties_df['street_address'].str.contains(filter_by_address, case=False, na=False)]
 
-def properties_response_with_metrics(logger, properties_df, down_payment_percentage, index_ticker, sort_by, sort_order, num_properties_per_page=1, page=1, saved_zpids={}):
-    num_properties_found = properties_df.shape[0]
-    full_properties_df = pd.concat([
-        properties_df,
-        calculate_dynamic_metrics(properties_df, down_payment_percentage).round(2)
+    # Calculate dynamic property metrics for properties which match the static attributes.
+    down_payment_percentage = float(property_attributes.get('down_payment_percentage', 20) or 20) / 100
+    override_annual_mortgage_rate = float(property_attributes.get('override_annual_mortgage_rate') or 'nan') if property_attributes.get('override_annual_mortgage_rate') else None
+    filtered_properties_df = pd.concat([
+        filtered_properties_df,
+        calculate_dynamic_metrics(filtered_properties_df, down_payment_percentage, override_annual_mortgage_rate=override_annual_mortgage_rate).round(2)
     ], axis=1)
-    full_properties_df.sort_values(by=FRONTEND_COL_NAME_TO_BACKEND_COL_NAME[sort_by], ascending=(sort_order == 'asc'), inplace=True)
 
-    total_pages = math.ceil(num_properties_found / num_properties_per_page)
-    start_property_index, stop_property_index = (page - 1) * num_properties_per_page, page * num_properties_per_page
-    full_properties_df = full_properties_df.iloc[start_property_index:stop_property_index].copy()
+    # Since properties can be filtered by dynamic metrics, sort after constructing the full metrics df.
+    sort_by = property_attributes.get('sortBy', 'CoC') or 'CoC'
+    sort_order = property_attributes.get('sortOrder', 'asc') or 'asc'
+    filtered_properties_df.sort_values(by=FRONTEND_COL_NAME_TO_BACKEND_COL_NAME[sort_by], ascending=(sort_order == 'asc'), inplace=True)
 
-    if not full_properties_df.empty:
-        full_properties_df = full_properties_df.merge(
-            calculate_series_metrics_df(down_payment_percentage, ZESTIMATE_HISTORY_DF, INDEX_DATA_DICT[index_ticker], RF_DATA, zpids=full_properties_df.index, logger=logger).round(2),
+    num_filtered_properties = filtered_properties_df.shape[0]
+
+    # Calculate series metrics after sorting by dynamic metrics we slice the target properties and calculate the
+    if properties_per_page != -1:
+        start_property_index, stop_property_index = (page - 1) * properties_per_page, page * properties_per_page
+        filtered_properties_df = filtered_properties_df.iloc[start_property_index:stop_property_index].copy()
+    if calculate_series_metrics:
+        index_ticker = property_attributes.get('index_ticker', '^GSPC') or '^GSPC'
+        filtered_properties_df = filtered_properties_df.merge(
+            calculate_series_metrics_df(
+                down_payment_percentage,
+                ZESTIMATE_HISTORY_DF,
+                filtered_properties_df['annual_mortgage_rate'],
+                INDEX_DATA_DICT[index_ticker],
+                RF_DATA,
+                override_annual_mortgage_rate=override_annual_mortgage_rate,
+                zpids=filtered_properties_df.index
+            ).round(2),
             left_index=True,
             right_index=True,
             how='left'
         )
+    
+    filtered_properties_df['zpid'] = filtered_properties_df.index
+    return filtered_properties_df, num_filtered_properties
 
-    full_properties_df['Save'] = full_properties_df.index.isin(saved_zpids)
-    full_properties_df['zpid'] = full_properties_df.index
 
-    full_properties_df.rename(columns=create_rename_dict(), inplace=True)
+def get_properties_response_from_attributes(property_attributes, filter_by_ids=set(), saved_ids=set()):
+    page = int(property_attributes.get('current_page', 1)) or 1
+    properties_per_page = int(property_attributes.get('num_properties_per_page', 1)) or 1
+    is_advanced_search = property_attributes.get('is_advanced_search')
 
-    if num_properties_found:
-        ordered_cols = TARGET_COLUMNS + [col for col in full_properties_df.columns if col not in set(TARGET_COLUMNS)]
-        ordered_properties_data = full_properties_df[ordered_cols].to_json(orient="records")
+    properties_df, num_properties = get_properties_from_attributes(
+        property_attributes,
+        page=page,
+        properties_per_page=properties_per_page,
+        calculate_series_metrics=is_advanced_search,
+        filter_by_ids=filter_by_ids
+    )
+    properties_df.rename(columns=create_rename_dict(), inplace=True)
+    # We add a 'Saved' status after constructing the properties from the attributes since it is not universally used in calculations.
+    properties_df['Save'] = properties_df.index.isin(saved_ids)
+    
+
+    num_pages = math.ceil(num_properties / properties_per_page)
+
+    if num_properties:
+        ordered_columns = TARGET_COLUMNS + [col for col in properties_df.columns if col not in set(TARGET_COLUMNS)]
+        ordered_properties_data = properties_df[ordered_columns].to_json(orient="records")
     else:
         ordered_properties_data = '{}'
+
     return {
         "properties": json.loads(ordered_properties_data),
         "descriptions": create_description_dict(),
-        "total_properties": num_properties_found,
-        "total_pages": total_pages,
+        "total_properties": num_properties,
+        "total_pages": num_pages,
     }
+
+def compare_properties_response_from_attributes(property_attributes):
+    # Assuming 'list_id' is now part of each property's dictionary
+    properties_df = pd.DataFrame(property_attributes.get('left_properties', []) + property_attributes.get('right_properties', []))
+    properties_df['annual_mortgage_rate'] = property_attributes['annual_interest_rate']
+
+    # Calculate individual property metrics
+    properties_df['monthly_costs'], properties_df['cash_invested'], properties_df['prepaid_costs'] = zip(*properties_df.apply(
+        lambda row: calculate_monthly_costs(row, row['down_payment_percentage'], row['annual_mortgage_rate']), axis=1))
+
+    return properties_df
+
+
+def create_filtered_properties_from_static_attributes(property_attributes, filter_by_ids=None):
+    # House Options.
+    home_type = property_attributes.get('home_type')
+
+    min_price = int(property_attributes.get('min_price') or 0)
+    max_price = int(property_attributes.get('max_price') or 0)
+
+    min_year_built = int(property_attributes.get('min_year_built') or 0)
+    max_year_built = int(property_attributes.get('max_year_built') or 0)
+
+    min_bedrooms = int(property_attributes.get('min_bedrooms') or 0)
+    max_bedrooms = int(property_attributes.get('max_bedrooms') or 0)
+
+    min_bathrooms = int(property_attributes.get('min_bathrooms') or 0)
+    max_bathrooms = int(property_attributes.get('max_bathrooms') or 0)
+
+    is_waterfront = property_attributes.get('is_waterfront')
+
+    # Location Options.
+    region = property_attributes.get('region')
+    city = property_attributes.get('city')
+
+    # Advanced Options.
+    is_cashflowing = property_attributes.get('is_cashflowing')
+
+    # Initialize properties and filter by ids.
+    properties_df = BACKEND_PROPERTIES_DF.copy()
+    if filter_by_ids:
+        properties_df = properties_df.loc[filter_by_ids]
+
+    # Filter House Options.
+    if home_type != "ANY":
+        properties_df = properties_df[properties_df['home_type'] == home_type]
+    if min_year_built:
+        properties_df = properties_df[properties_df['year_built'] >= min_year_built]
+    if max_year_built:
+        properties_df = properties_df[properties_df['year_built'] <= max_year_built]
+    if min_price:
+        properties_df = properties_df[properties_df['purchase_price'] >= min_price]
+    if max_price:
+        properties_df = properties_df[properties_df['purchase_price'] <= max_price]
+    if min_bedrooms:
+        properties_df = properties_df[properties_df['bedrooms'] >= min_bedrooms]
+    if max_bedrooms:
+        properties_df = properties_df[properties_df['bedrooms'] <= max_bedrooms]
+    if min_bathrooms:
+        properties_df = properties_df[properties_df['bathrooms'] >= min_bathrooms]
+    if max_bathrooms:
+        properties_df = properties_df[properties_df['bathrooms'] <= max_bathrooms]
+    if is_waterfront:
+        properties_df = properties_df[properties_df['is_waterfront'] == 'True']
+    
+    # Filter Location Options.
+    if region != "ANY_AREA":
+        properties_df = properties_df[properties_df['zip_code'].isin(REGION_TO_ZIP_CODE[region])]
+    if city:
+        properties_df = properties_df[properties_df['city'] == city.title()]
+
+    # Filter Advanced Options.
+    if is_cashflowing:
+        properties_df = properties_df[properties_df['monthly_rental_income'] >= 0.0]
+
+    return properties_df
