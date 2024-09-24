@@ -1,8 +1,15 @@
-import json
 import pandas as pd
 import numpy as np
+# Distribution graph imports
 from scipy.stats import gaussian_kde
 from scipy.stats import skew, kurtosis
+# Clusting graph imports
+from sklearn.manifold import TSNE
+from umap import UMAP
+from sklearn.cluster import KMeans, DBSCAN
+from hdbscan import HDBSCAN
+from scipy.cluster.hierarchy import linkage
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 
 from app_util import BACKEND_PROPERTIES_DF
 
@@ -25,6 +32,11 @@ numeric_agg_dict = {col: ['mean', 'sum', 'max', 'min'] for col in numeric_cols}
 
 # Aggregation dictionary for categorical columns (using count as an example)
 categorical_agg_dict = {col: ['count'] for col in categorical_cols}
+
+
+#####################
+# DISTRIBUTION DATA #
+#####################
 
 def calculate_statistics(data):
     mean_val = data.mean()
@@ -112,6 +124,80 @@ def prepare_distribution_graph_data(properties_df, aggregates, visualize_options
         "bin_widths": bin_widths,
         "percentiles": percentiles,
     }
+
+
+###################
+# CLUSTERING DATA #
+###################
+
+def calculate_umap_clusters(df, n_bins=8, sample_size=250, n_neighbors=15, min_dist=0.1, metric='euclidean'):
+    """Calculates UMAP embeddings for the given DataFrame and assigns them to bins.
+
+    Args:
+        df: The input DataFrame.
+        n_bins: The number of bins for clustering.
+        sample_size: The number of samples to use for UMAP calculation.
+        n_neighbors: The size of local neighborhood (in terms of number of neighboring sample points) used for manifold approximation.
+        min_dist: The effective minimum distance between embedded points.
+        metric: The metric to use for distance computation.
+
+    Returns:
+        A tuple of (umap_embeddings, bin_labels, bin_edges)
+    """
+
+    # Select only numeric columns
+    numeric_df = df.select_dtypes(include=['int64', 'float32', 'float64'])
+
+    # Sample the data if it exceeds the sample size
+    if len(numeric_df) > sample_size:
+        numeric_df = numeric_df.sample(sample_size, random_state=42)
+
+    # Dimensionality reduction using UMAP with optimized parameters
+    umap = UMAP(n_components=2, random_state=42, n_neighbors=n_neighbors, min_dist=min_dist, metric=metric)
+    umap_embeddings = umap.fit_transform(numeric_df)
+
+    # Calculate bin edges for both dimensions
+    bin_edges_x = np.linspace(np.min(umap_embeddings[:, 0]), np.max(umap_embeddings[:, 0]), n_bins + 1)
+    bin_edges_y = np.linspace(np.min(umap_embeddings[:, 1]), np.max(umap_embeddings[:, 1]), n_bins + 1)
+
+    # Assign points to bins based on their coordinates
+    bin_indices_x = np.digitize(umap_embeddings[:, 0], bin_edges_x, right=False) - 1
+    bin_indices_y = np.digitize(umap_embeddings[:, 1], bin_edges_y, right=False) - 1
+
+    # Create bin labels using list comprehensions
+    bin_labels_x = [f"{bin_edges_x[i]:.2f}-{bin_edges_x[i+1]:.2f}" for i in range(n_bins)]
+    bin_labels_y = [f"{bin_edges_y[i]:.2f}-{bin_edges_y[i+1]:.2f}" for i in range(n_bins)]
+
+    return umap_embeddings, bin_labels_x, bin_labels_y, bin_indices_x, bin_indices_y
+
+def prepare_clustering_graph_data(properties_df, sample_size=1000, n_neighbors=15, min_dist=0.1, metric='euclidean'):
+    """Prepares clustering graph data.
+
+    Args:
+        properties_df: The DataFrame containing properties.
+        sample_size: The number of samples to use for clustering calculations.
+        n_neighbors: The size of local neighborhood (in terms of number of neighboring sample points) used for manifold approximation.
+        min_dist: The effective minimum distance between embedded points.
+        metric: The metric to use for distance computation.
+
+    Returns:
+        A dictionary containing UMAP embeddings.
+    """
+
+    umap_embeddings, bin_labels_x, bin_labels_y, bin_indices_x, bin_indices_y = calculate_umap_clusters(
+        properties_df, n_bins=8, sample_size=sample_size, n_neighbors=n_neighbors, min_dist=min_dist, metric=metric
+    )
+
+    # Convert ndarrays to lists for JSON serialization
+    result = {
+        'umap_embeddings': umap_embeddings.tolist(),
+        'bin_labels_x': bin_labels_x,
+        'bin_labels_y': bin_labels_y,
+        'bin_indices_x': bin_indices_x.tolist(),
+        'bin_indices_y': bin_indices_y.tolist(),
+    }
+
+    return result
 
 
 if __name__ == '__main__':

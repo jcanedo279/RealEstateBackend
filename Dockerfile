@@ -1,6 +1,17 @@
 # Use an official Python runtime as a parent image
 FROM python:3.8-slim
 
+# Load .env variables into the Dockerfile from docker-compose.
+ARG CELERY_USER
+ARG CELERY_UID
+
+# Set environment variables for runtime
+ENV CELERY_USER=${CELERY_USER}
+ENV CELERY_UID=${CELERY_UID}
+
+# Print out the passed in values for debugging
+RUN echo "CELERY_USER=${CELERY_USER}" && echo "CELERY_UID=${CELERY_UID}
+
 # Set the working directory in the container
 WORKDIR /app
 
@@ -18,6 +29,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the Flask application directory into the container
 COPY src /app/src
+
+COPY src/seed_database_users.py /app/src/seed_database_users.py
 
 # Ensure the backend data is copied
 COPY backend_data /app/backend_data

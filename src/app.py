@@ -5,7 +5,9 @@ import jwt
 from datetime import datetime, timedelta, timezone
 
 from app_util import get_properties_response_from_attributes, get_properties_from_attributes, compare_properties_response_from_attributes, create_rename_dict, env, Env, BACKEND_PROPERTIES_DF
-from visual_analysis import prepare_distribution_graph_data
+from visual_analysis import prepare_distribution_graph_data, prepare_clustering_graph_data
+
+from app_database_util import db, init_migration, User
 
 from email_service_util import email_app
 
@@ -15,13 +17,20 @@ from flask_login import LoginManager, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity, set_access_cookies, set_refresh_cookies, unset_jwt_cookies
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
 
 from smtplib import SMTP
 
 from celery import Celery
 
 
-app = Flask(__name__, template_folder='../templates')
+DEV_DB_FOLDER = 'database'
+
+
+app = Flask(__name__,
+            template_folder='../templates',
+            instance_path=os.path.join(os.path.abspath(os.curdir), DEV_DB_FOLDER))
 # app.config['CORS_HEADERS'] = 'Content-Type'
 CORS(app, supports_credentials=True, resources={r'/api/*': {'origins': ['http://localhost']}})
 
@@ -53,6 +62,9 @@ celery_user, celery_password, celery_port = os.getenv('RABBITMQ_DEFAULT_USER'), 
 app.config['CELERY_BROKER_URL'] = f'pyamqp://{celery_user}:{celery_password}@rabbitmq:{celery_port}//'
 app.config['CELERY_RESULT_BACKEND'] = f'rpc://{celery_user}:{celery_password}@rabbitmq:{celery_port}//'
 
+# Configure the database.
+init_migration(app, env == Env.PROD)
+
 # Set up Celery asynchronous task manager.
 def celery_app(app):
     celery = Celery(
@@ -74,27 +86,6 @@ def celery_app(app):
 jwtManager = JWTManager(app)
 
 celery = celery_app(app)
-
-
-# Assuming a very simple user store
-users = {
-    'test@gmail.com': {
-        'id': 1,
-        'name': ('Test', 'Name'),
-        'password': generate_password_hash('pass'),
-        'is_professional': True,
-        'confirmed': True,
-        'saved': {2054668176, 125785286, 2054529325},
-    },
-    'unverified@gmail.com': {
-        'id': 2,
-        'name': ('Unverified', 'Name'),
-        'password': generate_password_hash('pass'),
-        'is_professional': False,
-        'confirmed': False,
-        'saved': {},
-    }
-}
 
 
 #############
@@ -122,20 +113,9 @@ def fancy_flash(message, status='info', flash_id='default', animation=None):
 ## USER MANAGEMENT ##
 #####################
 
-class User(UserMixin):
-    def __init__(self, email):
-        self.email = email
-        self.id = users[email]['id']
-        self.first_name, self.last_name = users[email]['name']
-        self.confirmed = users[email]['confirmed']
-        self.saved = users[email]['saved']
-
-    def get_id(self):
-        return str(self.id)
-
 @login_manager.user_loader
 def load_user(user_email):
-    return User(user_email)
+    return User.query.filter_by(email=user_email).first()
 
 def maybe_load_user(user_email):
     user_obj = None
@@ -258,6 +238,30 @@ def toggle_save():
         saved = True
     return jsonify({'success': True, 'saved': saved})
 
+@app.route('/api/compare', methods=['POST'])
+@jwt_required()
+def compare():
+    # Retrieve the user identity if the session is authenticated.
+    user_email = get_jwt_identity()
+    user_obj = maybe_load_user(user_email)
+
+    request_data = request.get_json()
+
+    response_data = compare_properties_response_from_attributes(request_data)
+    aggregates = response_data.groupby('list_id').agg({
+        'purchase_price': 'sum',
+        'monthly_costs': 'sum',
+        'cash_invested': 'sum',
+        'monthly_restimate': 'sum'
+    }).reset_index()
+
+    return Response(aggregates.to_json(), mimetype='application/json')
+
+
+#####################
+## GRAPHING ROUTES ##
+#####################
+
 @app.route('/api/distribution_graph_data', methods=['POST'])
 @jwt_required()
 def get_distribution_graph_data():
@@ -294,24 +298,41 @@ def get_distribution_graph_data():
     data = prepare_distribution_graph_data(properties_df, aggregates, visualize_options, bins, property_data)
     return jsonify(data)
 
-@app.route('/api/compare', methods=['POST'])
+@app.route('/api/clustering_graph_data', methods=['POST'])
 @jwt_required()
-def compare():
-    # Retrieve the user identity if the session is authenticated.
+def get_clustering_graph_data():
     user_email = get_jwt_identity()
     user_obj = maybe_load_user(user_email)
 
     request_data = request.get_json()
 
-    response_data = compare_properties_response_from_attributes(request_data)
-    aggregates = response_data.groupby('list_id').agg({
-        'purchase_price': 'sum',
-        'monthly_costs': 'sum',
-        'cash_invested': 'sum',
-        'monthly_restimate': 'sum'
-    }).reset_index()
+    is_saved = bool(request_data.get('is_saved', False))
+    saved_ids = set(user_obj.saved) if user_obj else set()
+    filter_by_ids = saved_ids if is_saved else set()
 
-    return Response(aggregates.to_json(), mimetype='application/json')
+    use_filtered_data = request_data.get('useFilteredData', False)
+    property_data = request_data.get('propertyData', {})
+
+    if use_filtered_data:
+        properties_df, _ = get_properties_from_attributes(
+            request_data,
+            calculate_series_metrics=False,
+            filter_by_ids=filter_by_ids
+        )
+        properties_df.rename(columns=create_rename_dict(), inplace=True)
+    else:
+        properties_df = BACKEND_PROPERTIES_DF.copy()
+        properties_df.rename(columns=create_rename_dict(), inplace=True)
+
+    app.logger.info("properties df: ", properties_df, properties_df.shape)
+    app.logger.info("proeprties df columns: ", list(properties_df.columns))
+
+    # Prepare data to send to the frontend
+    result = prepare_clustering_graph_data(properties_df)
+
+    app.logger.info("result: ", result)
+
+    return jsonify(result)
 
 
 ###########################
@@ -387,12 +408,15 @@ def start_authenticated_session():
     user_email, user_password = data.get('user_email'), data.get('user_password')
 
     # Check if input credentials are incorrect or unverified.
-    user = users.get(user_email)
-    if not user or not check_password_hash(user['password'], user_password):
+    app.logger.info(f"Trying to fetch: {user_email} from the backend...")
+    user = User.query.filter_by(email=user_email).first()
+    app.logger.info(f"User requested is: {user}")
+    if not user or not check_password_hash(user.password, user_password):
         return fancy_flash('Invalid username or password.', 'error', 'login', 'shake'), 200
-    if not user['confirmed']:
+    if not user.confirmed:
         return fancy_flash('Please verify your email.', 'error', 'login', 'shake'), 200
 
+    app.logger.info(f"{user}: is a valid user!")
     access_token, refresh_token = create_access_token(identity=user_email), create_refresh_token(identity=user_email)
     csrf_access_token, csrf_refresh_token = get_csrf_token_from_jwt(access_token), get_csrf_token_from_jwt(refresh_token)
 
@@ -443,16 +467,16 @@ def clean_session():
 def profile():
     user_email = get_jwt_identity()
     app.logger.info(f'User email is: {user_email}')
-    user = users.get(user_email)
+    user = User.query.filter_by(email=user_email).first()
     if not user:
         return jsonify({'msg': 'User not found'}), 404
 
     app.logger.info(f'User info isss: {user}.')
     user_info = {
         'email': user_email,
-        'first_name': user['name'][0],
-        'last_name': user['name'][1],
-        'saved': list(user['saved'])
+        'first_name': user.first_name,  # Directly access the first_name
+        'last_name': user.last_name,    # Directly access the last_name
+        'saved': list(user.saved) if user.saved else []  # Make sure to handle bytea or None correctly
     }
     return jsonify(user_info)
 
@@ -461,19 +485,24 @@ def register():
     data = request.get_json()
     user_email = data.get('userEmail')
 
+    app.logger.info(f"Registering user email: {user_email}")
     # Check if email already exists.
-    if user_email in users:
+    if User.query.filter_by(email=user_email).first():
         return jsonify(fancy_flash('Email already registered.', 'error', 'register', 'shake')), 200
 
-    # Add user to the 'database'.
-    users[user_email] = {
-        'id': len(users) + 1,
-        'name': (data.get('firstName'), data.get('lastName')),
-        'password': generate_password_hash(data.get('userPassword')),
-        'is_professional': data.get('isProfessional'),
-        'confirmed': False,
-        'saved': set()
-    }
+    # Add new user to the database.
+    new_user = User(
+        email=user_email,
+        first_name=data.get('firstName'),
+        last_name=data.get('lastName'),
+        password=generate_password_hash(data.get('userPassword')),
+        is_professional=data.get('isProfessional'),
+        confirmed=False,
+        saved=set()
+    )
+    app.logger.info(f"Adding user to db: {new_user}")
+    db.session.add(new_user)
+    db.session.commit()
 
     # Send confirmation email
     send_email_verification_email(user_email)
@@ -488,13 +517,12 @@ def delete_account():
     if not user_obj:
         return jsonify(fancy_flash('User not found.', 'error', 'delete-account', 'shake')), 404
 
-    # Remove user from the user store
-    if user_email in users:
-        del users[user_email]
-        response = jsonify(fancy_flash('Your account has been successfully deleted.', 'success', 'delete-account', 'fadeIn'))
-        return clear_jwts(response), 200
-    else:
-        return jsonify(fancy_flash('An error occurred while trying to delete your account.', 'error', 'delete-account', 'shake'))
+    # Remove user from the database instead of in-memory dictionary
+    db.session.delete(user_obj)
+    db.session.commit()
+    
+    response = jsonify(fancy_flash('Your account has been successfully deleted.', 'success', 'delete-account', 'fadeIn'))
+    return clear_jwts(response), 200
 
 @app.route('/api/email/verify/<token>', methods=['POST'])
 def email_verification(token):
@@ -503,7 +531,8 @@ def email_verification(token):
         app.logger.info(f'We have decoded the email: {user_email}, its type is: {type(token)}')
         user_obj = maybe_load_user(user_email)
         if user_obj:
-            users[user_email]['confirmed'] = True
+            user_obj.confirmed = True  # Update confirmed status
+            db.session.commit()  # Commit changes to the database
             return jsonify(fancy_flash('Email confirmed.', 'success', 'email-verify', 'fadeIn')), 200
     return jsonify(fancy_flash('Unable to locate user associated with the given email address.', 'error', 'email-verify', 'shake')), 200
 
@@ -518,7 +547,6 @@ def reset_password():
         send_password_reset_email(user_email)
         return jsonify(fancy_flash('A password reset link has been sent to your email.', 'success', 'password-request-new', 'fadeIn')), 200
     else:
-        app.logger.info(f'Users are: {users}')
         return jsonify(fancy_flash('No account found with that email address.', 'error', 'password-request-new', 'shake')), 200
 
 @app.route('/api/password/set-new/<token>', methods=['POST'])
@@ -532,12 +560,11 @@ def set_new_password(token):
 
         user_obj = maybe_load_user(user_email)
         if not user_obj:
-            app.logger.info(f'User not found, no users: {users}')
             return jsonify(fancy_flash('No user associated with the given email.', 'error', 'password-set-new', 'shake')), 200
 
         new_password = request.get_json()['new_password']
-        app.logger.info(f'User is: {user_obj}, new_pass is: {new_password}')
-        users[user_email]['password'] = generate_password_hash(new_password)
+        user_obj.password = generate_password_hash(new_password)
+        db.session.commit()
         return jsonify(fancy_flash('Your password has been updated.', 'success', 'password-set-new', 'fadeIn')), 200
     except (SignatureExpired, BadSignature):
         return jsonify(fancy_flash('The reset link is invalid or has expired.', 'error', 'password-set-new', 'shake')), 200
