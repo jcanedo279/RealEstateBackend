@@ -109,6 +109,11 @@ def fancy_flash(message, status='info', flash_id='default', animation=None):
     }
 
 
+@app.route("/health")
+def health():
+    return "OK", 200
+
+
 #####################
 ## USER MANAGEMENT ##
 #####################

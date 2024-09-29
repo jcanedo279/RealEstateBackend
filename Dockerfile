@@ -1,25 +1,26 @@
-# Use an official Python runtime as a parent image
+# Use an official Python runtime as a parent image.
 FROM python:3.8-slim
 
 # Load .env variables into the Dockerfile from docker-compose.
 ARG CELERY_USER
 ARG CELERY_UID
 
-# Set environment variables for runtime
+# Set environment variables for runtime.
 ENV CELERY_USER=${CELERY_USER}
 ENV CELERY_UID=${CELERY_UID}
 
-# Print out the passed in values for debugging
-RUN echo "CELERY_USER=${CELERY_USER}" && echo "CELERY_UID=${CELERY_UID}
-
-# Set the working directory in the container
+# Set the working directory in the container.
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies.
 RUN apt-get update && apt-get install -y \
     gcc \
     libc-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy the backend files over to the container and set the appropriate permissions.
+COPY . /app
+RUN chown -R ${CELERY_UID}:${CELERY_UID} /app
 
 # Copy the requirements file into the container at /app
 COPY requirements.txt /app/
@@ -32,10 +33,10 @@ COPY src /app/src
 
 COPY src/seed_database_users.py /app/src/seed_database_users.py
 
-# Ensure the backend data is copied
+# Copy and set permissions for backend data and templates.
 COPY backend_data /app/backend_data
-# Ensure the static html templates are copied
 COPY templates /app/templates
+RUN chown -R ${CELERY_UID}:${CELERY_UID} /app/backend_data /app/templates
 
 # Change the working directory to the Flask application directory
 WORKDIR /app/src
